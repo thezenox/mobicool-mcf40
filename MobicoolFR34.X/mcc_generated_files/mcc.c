@@ -60,17 +60,15 @@ void SYSTEM_Initialize(void)
 
 void OSCILLATOR_Initialize(void)
 {
-    // SCS INTOSC; SPLLEN disabled; IRCF 1MHz_HF; 
-    OSCCON = 0x5A;
-    // TUN 0; 
+    // RSTOSC = HFINT1 already selects HFINTOSC at 1MHz out of reset,
+    // which matches _XTAL_FREQ - nothing to reconfigure here
+    // HFTUN 0;
     OSCTUNE = 0x00;
-    // SBOREN disabled; 
-    BORCON = 0x00;
 }
 
 void WDT_Initialize(void)
 {
-    // WDTPS 1:65536; SWDTEN OFF; 
+    // WDTPS 1:65536; SWDTEN OFF;
     WDTCON = 0x16;
 }
 

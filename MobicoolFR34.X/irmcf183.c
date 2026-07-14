@@ -24,6 +24,7 @@ static const uint8_t s_supported_speeds[] = { 3, 6, 9, 17, 19, 22, 25, 33, 35, 3
 #define NUM_SPEEDS (sizeof(s_supported_speeds) / sizeof(s_supported_speeds[0]))
 
 static bool s_compressor_on = false;
+static bool s_fan_on = false;
 
 static void UART_Xmit(uint8_t* buf, uint8_t len) {
     uint8_t chksum = 0;
@@ -49,10 +50,15 @@ void Compressor_OnOff(bool on, bool fanon, uint8_t speedidx) {
     newspeed = s_supported_speeds[speedidx];
     UART_Xmit( (uint8_t[]){0xe1, 0xeb, 0x90, on ? 1 : 0, newspeed, 0x00, 0x00}, 7);
     s_compressor_on = on;
+    s_fan_on = fanon;
 }
 
 bool Compressor_IsOn(void) {
     return s_compressor_on;
+}
+
+bool Compressor_IsFanOn(void) {
+    return s_fan_on;
 }
 
 uint8_t Compressor_GetMinSpeedIdx(void) {

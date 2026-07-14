@@ -92,16 +92,19 @@ typedef struct
    None
  */
 
+// PIC16F18346 CHS encoding is port based: 0b0PPPBBB with PPP = port (0=A,1=B,2=C)
+// and BBB = bit. Names kept from the original PIC16F1829 project (ANx numbers).
 typedef enum
 {
-    AN2_VoltMon =  0x2,
-    AN5_NTC =  0x5,
-    AN7_FanCur =  0x7,
-    AN8_CompCur =  0x8,
-    AN10_1V8Mon =  0xA,
-    channel_Temp =  0x1D,
-    channel_DAC =  0x1E,
-    channel_FVR =  0x1F
+    AN2_VoltMon =  0x02,  // ANA2, RA2
+    AN5_NTC =  0x11,      // ANC1, RC1
+    AN7_FanCur =  0x13,   // ANC3, RC3
+    AN8_CompCur =  0x16,  // ANC6, RC6
+    AN10_1V8Mon =  0x0C,  // ANB4, RB4
+    channel_AVSS = 0x3B,
+    channel_Temp =  0x3C,
+    channel_DAC1 =  0x3D,
+    channel_FVR =  0x3F
 } adc_channel_t;
 
 /**

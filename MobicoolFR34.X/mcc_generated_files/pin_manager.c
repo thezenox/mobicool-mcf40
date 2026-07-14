@@ -83,17 +83,17 @@ void PIN_MANAGER_Initialize(void)
     WPUB = 0x00;
     WPUA = 0x00;
     WPUC = 0x00;
-    OPTION_REGbits.nWPUEN = 1;
 
     /**
     ODx registers
     */
 
     /**
-    APFCONx registers
+    PPS: route the EUSART to the pins used on the Mobicool board
+    (PPS1WAY is OFF and PPSLOCK stays unlocked after reset)
     */
-    APFCON0 = 0x00;
-    APFCON1 = 0x00;
+    RXPPS = 0x0D;   // RB5->EUSART:RX
+    RB7PPS = 0x14;  // RB7->EUSART:TX
 
 
 

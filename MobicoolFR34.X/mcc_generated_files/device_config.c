@@ -44,23 +44,29 @@
     SOFTWARE.
 */
 
-// Configuration bits: selected in the GUI
+// Configuration bits for PIC16F18346 (ported from PIC16F1829)
 
 // CONFIG1
-#pragma config FOSC = INTOSC    // Oscillator Selection->INTOSC oscillator: I/O function on CLKIN pin
-#pragma config WDTE = OFF    // Watchdog Timer Enable->WDT disabled
-#pragma config PWRTE = OFF    // Power-up Timer Enable->PWRT disabled
-#pragma config MCLRE = ON    // MCLR Pin Function Select->MCLR/VPP pin function is MCLR
-#pragma config CP = OFF    // Flash Program Memory Code Protection->Program memory code protection is disabled
-#pragma config CPD = OFF    // Data Memory Code Protection->Data memory code protection is disabled
-#pragma config BOREN = ON    // Brown-out Reset Enable->Brown-out Reset enabled
-#pragma config CLKOUTEN = OFF    // Clock Out Enable->CLKOUT function is disabled. I/O or oscillator function on the CLKOUT pin
-#pragma config IESO = ON    // Internal/External Switchover->Internal/External Switchover mode is enabled
-#pragma config FCMEN = ON    // Fail-Safe Clock Monitor Enable->Fail-Safe Clock Monitor is enabled
+#pragma config FEXTOSC = OFF    // External Oscillator not enabled
+#pragma config RSTOSC = HFINT1    // Power-up default HFINTOSC 1MHz (matches _XTAL_FREQ, no OSC setup needed)
+#pragma config CLKOUTEN = OFF    // CLKOUT function is disabled
+#pragma config CSWEN = ON    // Writing to NOSC and NDIV is allowed
+#pragma config FCMEN = ON    // Fail-Safe Clock Monitor is enabled
 
 // CONFIG2
-#pragma config WRT = OFF    // Flash Memory Self-Write Protection->Write protection off
-#pragma config PLLEN = OFF    // PLL Enable->4x PLL disabled
-#pragma config STVREN = ON    // Stack Overflow/Underflow Reset Enable->Stack Overflow or Underflow will cause a Reset
-#pragma config BORV = LO    // Brown-out Reset Voltage Selection->Brown-out Reset Voltage (Vbor), low trip point selected.
-#pragma config LVP = ON    // Low-Voltage Programming Enable->Low-voltage programming enabled
+#pragma config MCLRE = ON    // MCLR/VPP pin function is MCLR
+#pragma config PWRTE = OFF    // PWRT disabled
+#pragma config WDTE = OFF    // WDT disabled
+#pragma config LPBOREN = OFF    // ULPBOR disabled
+#pragma config BOREN = ON    // Brown-out Reset enabled
+#pragma config BORV = LOW    // Brown-out voltage (Vbor) set to 2.45V
+#pragma config PPS1WAY = OFF    // PPSLOCK can be set and cleared repeatedly
+#pragma config STVREN = ON    // Stack Overflow or Underflow will cause a Reset
+
+// CONFIG3
+#pragma config WRT = OFF    // Write protection off
+#pragma config LVP = ON    // Low Voltage programming enabled (keep ON so the MPLAB Snap keeps working!)
+
+// CONFIG4
+#pragma config CP = OFF    // Program memory code protection disabled
+#pragma config CPD = OFF    // Data NVM code protection disabled

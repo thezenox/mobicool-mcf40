@@ -16,9 +16,14 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-// Todo:
-// Implement fan over-current error handling
-// Implement compressor stall error reporting
+// Modifications compared to upstream mobicool-fr34:
+// - Battery monitor Lo/Med/Hi presets (with 12V/24V auto-detection) replaced by
+//   directly adjustable cutout ("L x.x") and restart ("H x.x") voltages in the
+//   SET menu, so odd packs like 5S LiFePO4 (~17.3V) don't get misdetected as a
+//   drained 24V system
+// - Maximum temperature setpoint raised from 10C to 18C
+// - Fan over-current error handling implemented (error code Er2)
+// - Compressor stall / failed start error reporting implemented (error code Er3)
 
 // This was all that was stored in the EEPROM in original firmware:
 // af 2c 00
@@ -30,14 +35,31 @@
 #include "analog.h"
 #include "irmcf183.h"
 
-#define MAX_TEMP (10)
+#define MAX_TEMP (18)
 #define MIN_TEMP (-18)
 #define DEFAULT_TEMP MAX_TEMP
 
 #define DEFAULT_BRIGHT (4)
 #define DIM_BRIGHT (0)
 
-#define MAGIC ('W')
+#define MAGIC ('F') // Changed from 'W': EEPROM layout differs from upstream
+
+// Battery protection voltages, all in tenths of Volts
+#define VOLT_SETTING_MIN (80)  // 8.0V lowest selectable cutout
+#define VOLT_SETTING_MAX (280) // 28.0V highest selectable restart (mains adapter feeds ~27V)
+#define VOLT_HYST_MIN (3)      // Restart must stay at least 0.3V above cutout
+#define DEFAULT_VOLT_CUTOUT (96)
+#define DEFAULT_VOLT_RESTART (109)
+
+// Fan over-current handling: 150mOhm shunt on the fan output, a healthy fan
+// draws a few hundred mA, so anything above this sustained means jammed/shorted
+#define FAN_OC_LIMIT (800)  // mA
+#define FAN_OC_SAMPLES (8)  // consecutive main loop iterations (~0.5s)
+
+// Compressor stall detection: commanded to run but drawing almost no power
+#define COMP_STALL_POWER (5) // W
+#define COMP_STALL_SECS (15) // seconds below COMP_STALL_POWER while in RUN
+#define ERR_RETRY_SECS (60)  // lockout before retrying after an error
 
 typedef enum {
     IDLE = 0,
@@ -45,7 +67,8 @@ typedef enum {
     SET_BEGIN,
     SET_TEMP,
     SET_UNIT,
-    SET_BATTMON,
+    SET_VMIN,
+    SET_VMAX,
     SET_END,
 
     DISP_BEGIN,
@@ -63,7 +86,8 @@ typedef enum {
     EE_ONOFF,
     EE_TEMP,
     EE_UNIT,
-    EE_BATTMON,
+    EE_VCUT,                    // 16-bit, tenths of Volts
+    EE_VRESTART = EE_VCUT + 2,  // 16-bit, tenths of Volts
 } eedata_t;
 
 typedef enum {
@@ -73,38 +97,22 @@ typedef enum {
     COMP_RUN,
 } comp_state_t;
 
+// Numeric values double as the displayed error code ("Er 2" / "Er 3"),
+// mimicking the Danfoss/Secop error numbering
 typedef enum {
-    BMON_DIS = 0,
-    BMON_LOW,
-    BMON_MED,
-    BMON_HIGH
-} bmon_t;
+    ERR_NONE = 0,
+    ERR_FAN = 2,  // Fan over-current
+    ERR_COMP = 3, // Compressor stall or failure to start
+} errcode_t;
 
-typedef enum {
-    BMON_WILDCARD = 0,
-    BMON_12V,
-    BMON_24V
-} bmon_volt_t;
+static uint16_t EE_ReadWord(uint8_t addr) {
+    return (uint16_t)DATAEE_ReadByte(addr) | ((uint16_t)DATAEE_ReadByte(addr + 1) << 8);
+}
 
-typedef struct {
-    bmon_t level;
-    bmon_volt_t supply;
-    int16_t cutout;
-    int16_t restart;
-} battlevel_t;
-
-#define THRESH_12V_24V (170) // Over 17.0V == 24V system, below == 12V system
-
-static const battlevel_t levels[] = {
-    { BMON_DIS, BMON_WILDCARD, 96, 109 }, // Not quite disabled, but the system won't work at lower levels anyway
-    { BMON_LOW, BMON_12V, 101, 111 },
-    { BMON_MED, BMON_12V, 114, 122 },
-    { BMON_HIGH, BMON_12V, 118, 126 },
-    { BMON_LOW, BMON_24V, 215, 230 },
-    { BMON_MED, BMON_24V, 241, 253 },
-    { BMON_HIGH, BMON_24V, 246, 262 },
-};
-#define NUM_BMON_LEVELS (sizeof(levels) / sizeof(levels[0]))
+static void EE_WriteWord(uint8_t addr, uint16_t val) {
+    DATAEE_WriteByte(addr, val & 0xff);
+    DATAEE_WriteByte(addr + 1, val >> 8);
+}
 
 void main(void) {
     // initialize the device
@@ -151,8 +159,10 @@ void main(void) {
         eeinvalid = true;
     }
     bool fahrenheit = DATAEE_ReadByte(EE_UNIT);
-    bmon_t battmon = DATAEE_ReadByte(EE_BATTMON);
-    if (battmon > BMON_HIGH) {
+    uint16_t volt_cutout = EE_ReadWord(EE_VCUT);
+    uint16_t volt_restart = EE_ReadWord(EE_VRESTART);
+    if (volt_cutout < VOLT_SETTING_MIN || volt_restart > VOLT_SETTING_MAX ||
+        volt_restart < volt_cutout + VOLT_HYST_MIN) {
         eeinvalid = true;
     }
     if (eeinvalid) {
@@ -162,17 +172,20 @@ void main(void) {
         DATAEE_WriteByte(EE_TEMP, temp_setpoint);
         fahrenheit = false;
         DATAEE_WriteByte(EE_UNIT, fahrenheit);
-        battmon = BMON_LOW;
-        DATAEE_WriteByte(EE_BATTMON, battmon);
+        volt_cutout = DEFAULT_VOLT_CUTOUT;
+        EE_WriteWord(EE_VCUT, volt_cutout);
+        volt_restart = DEFAULT_VOLT_RESTART;
+        EE_WriteWord(EE_VRESTART, volt_restart);
         DATAEE_WriteByte(EE_MAGIC, MAGIC); // Always write magic at the end
     }
-    
+
     AnalogUpdate();
     uint8_t longpress = 0;
     bool newon = on;
     int8_t newtemp = temp_setpoint;
     bool newfahrenheit = fahrenheit;
-    bmon_t newbattmon = battmon;
+    uint16_t newvcut = volt_cutout;
+    uint16_t newvrestart = volt_restart;
     int16_t temp_setpoint10 = temp_setpoint * 10;
     int16_t tempacc = 0;
     uint8_t numtemps = 0;
@@ -185,7 +198,11 @@ void main(void) {
     uint32_t voltacc = 0;
     uint8_t numvolts = 0;
     bool battlow = false;
-    
+    uint8_t keyrepeat = 0;
+    errcode_t error = ERR_NONE;
+    uint8_t fan_oc_count = 0;
+    uint8_t stall_secs = 0;
+
     while (1) {
         bool compressor_check = false;
         if (TMR1_HasOverflowOccured()) {
@@ -221,20 +238,13 @@ void main(void) {
         if (numvolts == 64) {
             uint16_t volt = (voltacc + 32) >> 6;
             volt = (volt + 50) / 100; // Scale to tenths of Volts
-            bmon_volt_t supply = (volt > THRESH_12V_24V) ? BMON_24V : BMON_12V;
-            for (uint8_t i = 0; i < NUM_BMON_LEVELS; i++) {
-                if (levels[i].level == battmon &&
-                    (levels[i].supply == BMON_WILDCARD || levels[i].supply == supply)) {
-                    if (volt < levels[i].cutout && !battlow) {
-                        battlow = true;
-                        Compressor_OnOff(false, false, 0);
-                        comp_timer = 20;
-                        compstate = COMP_LOCKOUT;
-                    } else if (volt > levels[i].restart && battlow) {
-                        battlow = false;
-                    }
-                    break;
-                }
+            if (volt < volt_cutout && !battlow) {
+                battlow = true;
+                Compressor_OnOff(false, false, 0);
+                comp_timer = 20;
+                compstate = COMP_LOCKOUT;
+            } else if (volt > volt_restart && battlow) {
+                battlow = false;
             }
             voltacc = numvolts = 0;
         }
@@ -244,11 +254,35 @@ void main(void) {
         uint16_t fancurrent = AnalogGetFanCurrent();
         uint8_t comppower = AnalogGetCompPower();
 
+        // Fan over-current error handling
+        if (Compressor_IsFanOn() && fancurrent > FAN_OC_LIMIT) {
+            if (++fan_oc_count >= FAN_OC_SAMPLES) {
+                fan_oc_count = 0;
+                error = ERR_FAN;
+                Compressor_OnOff(false, false, 0);
+                comp_timer = ERR_RETRY_SECS;
+                compstate = COMP_LOCKOUT;
+            }
+        } else {
+            fan_oc_count = 0;
+        }
+
         uint8_t keys = TM1620B_GetKeys();
         uint8_t pressed_keys = keys & ~lastkeys;
 
+        // Auto-repeat for held +/- keys (temperature and voltage settings)
+        uint8_t repeat_keys = pressed_keys;
+        if (keys & (KEY_PLUS | KEY_MINUS)) {
+            if (keyrepeat < 255) keyrepeat++;
+            if (keyrepeat > 12 && (keyrepeat & 1)) {
+                repeat_keys |= keys & (KEY_PLUS | KEY_MINUS);
+            }
+        } else {
+            keyrepeat = 0;
+        }
+
         bool comp_on = Compressor_IsOn();
-        uint8_t leds = /*orange*/!comp_on << 7 | /*err*/battlow << 6 | /*green*/comp_on << 4;
+        uint8_t leds = /*orange*/!comp_on << 7 | /*err*/(battlow || error != ERR_NONE) << 6 | /*green*/comp_on << 4;
 
         if (keys & KEY_ONOFF) {
             if (longpress <= 20) longpress++;
@@ -263,6 +297,9 @@ void main(void) {
                     Compressor_OnOff(false, false, 0);
                     comp_timer = 20;
                     compstate = COMP_LOCKOUT;
+                    error = ERR_NONE;
+                    fan_oc_count = 0;
+                    stall_secs = 0;
                     TM1620B_SetBrightness(true, DIM_BRIGHT);
                 }
             }
@@ -276,10 +313,11 @@ void main(void) {
             IO_LightEna_SetLow();
             leds = 0;
             pressed_keys = 0;
+            repeat_keys = 0;
             compressor_check = false;
         }
 
-        if (pressed_keys) {            
+        if (pressed_keys) {
             flashtimer = 0; // restart flash timer on every keypress
             idletimer = 0;
             dimtimer = 0;
@@ -293,16 +331,18 @@ void main(void) {
             cur_state++;
             if (cur_state == DISP_END) cur_state = IDLE;
         }
-        
+
         if (pressed_keys & KEY_SET) {
             if (cur_state < SET_BEGIN || cur_state > SET_END) {
                 cur_state = SET_BEGIN;
                 newtemp = temp_setpoint;
+                newvcut = volt_cutout;
+                newvrestart = volt_restart;
             }
             cur_state++;
             if (cur_state == SET_END) cur_state = IDLE;
         }
-        
+
         if (cur_state == IDLE) { // Perform housekeeping if we need to update settings
             if (newon != on) {
                 on = newon;
@@ -317,12 +357,16 @@ void main(void) {
                 fahrenheit = newfahrenheit;
                 DATAEE_WriteByte(EE_UNIT, fahrenheit);
             }
-            if (newbattmon != battmon) {
-                battmon = newbattmon;
-                DATAEE_WriteByte(EE_BATTMON, battmon);
+            if (newvcut != volt_cutout) {
+                volt_cutout = newvcut;
+                EE_WriteWord(EE_VCUT, volt_cutout);
+            }
+            if (newvrestart != volt_restart) {
+                volt_restart = newvrestart;
+                EE_WriteWord(EE_VRESTART, volt_restart);
             }
         }
-        
+
         switch (cur_state) {
             case DISP_VOLT: {
                 uint8_t buf[5];
@@ -381,8 +425,8 @@ void main(void) {
             }
             case SET_TEMP: {
                 uint8_t buf[5] = {leds, 0, 0, 0, fahrenheit ? c_F : c_C | ADD_DOT};
-                if (pressed_keys & KEY_MINUS && newtemp > MIN_TEMP) newtemp--;
-                if (pressed_keys & KEY_PLUS && newtemp < MAX_TEMP) newtemp++;
+                if (repeat_keys & KEY_MINUS && newtemp > MIN_TEMP) newtemp--;
+                if (repeat_keys & KEY_PLUS && newtemp < MAX_TEMP) newtemp++;
                 if (!(flashtimer & 0x08)) {
                     int8_t disptemp = fahrenheit ? ((((newtemp * 9) + 2) / 5) + 32) : newtemp;
                     uint8_t num = FormatDigits(NULL, disptemp, 0);
@@ -397,32 +441,31 @@ void main(void) {
                 }
                 TM1620B_Update( (uint8_t[]){leds, 0, 0, 0, (flashtimer & 0x08 ? 0 : (newfahrenheit ? c_F : c_C)) | ADD_DOT} );
                 break;
-            case SET_BATTMON: {
-                bool show = !(flashtimer & 0x8);
-                if (pressed_keys & KEY_MINUS && newbattmon > BMON_DIS) newbattmon--;
-                if (pressed_keys & KEY_PLUS && newbattmon < BMON_HIGH) newbattmon++;
-                uint8_t buf[] = {leds, 0, 0, 0, 0};
-                if (show) {
-                    switch (newbattmon) {
-                        case BMON_DIS:
-                            buf[2] = c_d;
-                            buf[3] = c_i;
-                            buf[4] = c_S;
-                            break;
-                        case BMON_LOW:
-                            buf[2] = c_L;
-                            buf[3] = c_o;
-                            break;
-                        case BMON_MED:
-                            buf[2] = c_M;
-                            buf[3] = c_E;
-                            buf[4] = c_d;
-                            break;
-                        case BMON_HIGH:
-                            buf[2] = c_H;
-                            buf[3] = c_i;
-                            break;
+            case SET_VMIN: { // Battery monitor cutout voltage, shown as "L xx.x"
+                if (repeat_keys & KEY_MINUS && newvcut > VOLT_SETTING_MIN) newvcut--;
+                if (repeat_keys & KEY_PLUS && newvcut < VOLT_SETTING_MAX - VOLT_HYST_MIN) {
+                    newvcut++;
+                    if (newvrestart < newvcut + VOLT_HYST_MIN) {
+                        newvrestart = newvcut + VOLT_HYST_MIN; // Keep hysteresis intact
                     }
+                }
+                uint8_t buf[5] = {leds, c_L, 0, 0, 0};
+                if (!(flashtimer & 0x08)) {
+                    uint8_t num = FormatDigits(NULL, (int16_t)newvcut, 2);
+                    FormatDigits(&buf[5 - num], (int16_t)newvcut, 2);
+                    buf[3] |= ADD_DOT;
+                }
+                TM1620B_Update( buf );
+                break;
+            }
+            case SET_VMAX: { // Battery monitor restart voltage, shown as "H xx.x"
+                if (repeat_keys & KEY_MINUS && newvrestart > newvcut + VOLT_HYST_MIN) newvrestart--;
+                if (repeat_keys & KEY_PLUS && newvrestart < VOLT_SETTING_MAX) newvrestart++;
+                uint8_t buf[5] = {leds, c_H, 0, 0, 0};
+                if (!(flashtimer & 0x08)) {
+                    uint8_t num = FormatDigits(NULL, (int16_t)newvrestart, 2);
+                    FormatDigits(&buf[5 - num], (int16_t)newvrestart, 2);
+                    buf[3] |= ADD_DOT;
                 }
                 TM1620B_Update( buf );
                 break;
@@ -458,6 +501,15 @@ void main(void) {
                         buf[2] = c_A;
                         buf[3] = buf[4] = c_t;
                     }
+                } else if (error != ERR_NONE) {
+                    if ((flashtimer & 0x0f) < 0xa) {
+                        buf[1] = buf[2] = buf[3] = buf[4] = 0;
+                    } else if (flashtimer & 0x10) {
+                        buf[1] = c_E;
+                        buf[2] = c_r;
+                        buf[3] = 0;
+                        buf[4] = hexdigits[error];
+                    }
                 }
                 TM1620B_Update( buf );
                 break;
@@ -468,7 +520,7 @@ void main(void) {
             case DISP_END:
                 break;
         }
-        
+
         if (compressor_check) {
             uint8_t min = Compressor_GetMinSpeedIdx();
             uint8_t max = Compressor_GetMaxSpeedIdx();
@@ -499,10 +551,28 @@ void main(void) {
                         temp_rate_tick = 0;
                         temp_rate = 0;
                         last_temp = temperature10;
+                        stall_secs = 0;
                         comp_timer = 30;
                     }
                     break;
                 case COMP_RUN:
+                    // Compressor stall / failed start reporting: commanded on
+                    // but drawing (almost) no power for a while means the rotor
+                    // never started or got stuck - back off and retry later
+                    if (comppower < COMP_STALL_POWER) {
+                        if (++stall_secs >= COMP_STALL_SECS) {
+                            stall_secs = 0;
+                            error = ERR_COMP;
+                            Compressor_OnOff(false, true, 0);
+                            comp_timer = ERR_RETRY_SECS;
+                            compstate = COMP_LOCKOUT;
+                            fanspin = 5;
+                            break;
+                        }
+                    } else {
+                        stall_secs = 0;
+                        error = ERR_NONE; // Compressor runs fine again, clear any error
+                    }
                     speedidx = comp_speed;
                     temp_rate_tick++;
                     if (temp_rate_tick == 60) {

@@ -112,7 +112,7 @@ uint16_t TMR1_ReadTimer(void)
 
 void TMR1_WriteTimer(uint16_t timerVal)
 {
-    if (T1CONbits.nT1SYNC == 1)
+    if (T1CONbits.T1SYNC == 1)
     {
         // Stop the Timer by writing to TMRxON bit
         T1CONbits.TMR1ON = 0;
@@ -139,7 +139,7 @@ void TMR1_Reload(void)
 
 void TMR1_StartSinglePulseAcquisition(void)
 {
-    T1GCONbits.T1GGO = 1;
+    T1GCONbits.T1GGO_nDONE = 1;
 }
 
 uint8_t TMR1_CheckGateValueStatus(void)
